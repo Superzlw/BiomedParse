@@ -6,6 +6,7 @@
   python test_batch.py --check                             # 只检查数据（配对/尺寸/标签分布），不加载模型
   CUDA_VISIBLE_DEVICES=1 python test_batch.py --limit 50   # 随机抽 50 张试跑
   CUDA_VISIBLE_DEVICES=1 python test_batch.py              # 全量
+  CUDA_VISIBLE_DEVICES=1 python test_batch.py --thr 0.2,0.3,0.4,0.5   # 一次评多个阈值（不增加推理次数）
 
 评测协议（与 BiomedParse 论文一致）：每张图只对 GT 中出现的类别发 prompt，Dice 只在该类别出现的图上统计，
 衡量的是"已知目标存在时分得准不准"，不衡量"能否判断目标不存在"。
@@ -14,8 +15,12 @@
 像素规则：未标注(0) 永远不参与计算；背景(11) 不作为类别评测，但模型在背景上的预测默认算误报；
 加 --ignore-background 则背景像素也完全不参与计算。
 
-输出（--out 目录）：config.json（参数与 prompt）、per_tile.csv（每张图每个类别的像素数与 Dice）、
-summary.csv（每类与各组的汇总）、vis/（--save-vis 时的对比图：原图 | GT | 预测）。
+输出（--out 目录）：
+  config.json   参数与 prompt
+  per_tile.csv  每个阈值 × 每张图 × 每个类别：像素数、Dice、预测像素落在各 GT 标签上的数量（pred_on_<标签>）
+  summary.csv   每个阈值下每类与各组的汇总（含 precision / recall）
+  landing.csv   每个阈值下，每个 prompt 的预测像素落在各 GT 标签上的比例（只统计 GT 含该类别的图）
+  vis/          --save-vis 时的对比图：原图 | GT | 预测（用最接近 0.5 的阈值）
 """
 import argparse
 import csv
@@ -44,6 +49,9 @@ CLASSES = {
     "mucin":                    ((10,),     None),
 }
 UNANNOTATED, BACK = 0, 11
+N_LABELS = 12                       # 标签值 0..11
+SHORT = {0: "unann", 1: "epi", 2: "mucosa", 3: "conn3", 4: "conn4", 5: "muscle",
+         6: "conn6", 7: "lymph", 8: "necro", 9: "ery", 10: "mucin", 11: "bg"}
 
 NAMES = list(CLASSES)
 RELATED = [c for c in NAMES if CLASSES[c][1] is not None]
@@ -61,6 +69,10 @@ def dice(tp, p, g):
     return 2.0 * tp / (p + g) if (p + g) > 0 else NAN
 
 
+def ratio(a, b):
+    return a / b if b > 0 else NAN
+
+
 def valid_region(mask, ignore_bg):
     """参与计算的像素：去掉未标注；--ignore-background 时再去掉背景。"""
     v = mask != UNANNOTATED
@@ -76,20 +88,28 @@ def tile_counts(mask, pred, labels, valid):
     return int((pr & gt).sum()), int(pr.sum()), int(gt.sum())
 
 
+def pred_breakdown(mask, pred):
+    """预测像素落在各个 GT 标签（0..11，含未标注和背景）上的像素数。"""
+    return np.bincount(mask[pred].ravel(), minlength=N_LABELS)[:N_LABELS]
+
+
 def new_stat():
-    return {"n": 0, "dsum": 0.0, "tp": 0, "p": 0, "g": 0, "tp_all": 0, "p_all": 0, "g_all": 0}
+    return {"n": 0, "dsum": 0.0, "tp": 0, "p": 0, "g": 0, "tp_all": 0, "p_all": 0, "g_all": 0,
+            "land": np.zeros(N_LABELS, np.int64)}
 
 
-def add(stat, tp, p, g):
+def add(stat, tp, p, g, land=None):
     stat["tp_all"] += tp
     stat["p_all"] += p
     stat["g_all"] += g
-    if g > 0:                       # 只有 GT 里有这个类别的图才进入 mean / pooled
+    if g > 0:                       # 只有 GT 里有这个类别的图才进入 mean / pooled / landing
         stat["n"] += 1
         stat["dsum"] += dice(tp, p, g)
         stat["tp"] += tp
         stat["p"] += p
         stat["g"] += g
+        if land is not None:
+            stat["land"] += land
 
 
 def summarize(stats, all_prompts):
@@ -101,6 +121,8 @@ def summarize(stats, all_prompts):
             "mean": s["dsum"] / s["n"] if s["n"] else NAN,
             "pooled": dice(s["tp"], s["p"], s["g"]),
             "all": dice(s["tp_all"], s["p_all"], s["g_all"]) if all_prompts else NAN,
+            "prec": ratio(s["tp"], s["p"]),
+            "recall": ratio(s["tp"], s["g"]),
         }
     groups = {}
     for g, members in GROUPS.items():
@@ -127,16 +149,18 @@ def selftest():
     pred[0, 0] = pred[0, 3] = pred[1, 3] = True
     assert tile_counts(m, pred, (1,), valid_region(m, False)) == (1, 2, 2)   # 未标注不计，背景算误报
     assert tile_counts(m, pred, (1,), valid_region(m, True)) == (1, 1, 2)    # 背景也不计
+    assert pred_breakdown(m, pred).tolist() == [1, 1] + [0] * 9 + [1]       # 落在标签 0、1、11 各 1 个
     # connective = 标签 3/4/6 合并；整张图都预测成它
     allp = np.ones(m.shape, bool)
     assert tile_counts(m, allp, (3, 4, 6), valid_region(m, False)) == (3, 11, 3)
     assert tile_counts(m, allp, (3, 4, 6), valid_region(m, True)) == (3, 8, 3)
 
     st = {c: new_stat() for c in NAMES}
-    add(st["epithelial tissue"], 4, 5, 5)    # 单张 Dice 0.8
-    add(st["epithelial tissue"], 4, 5, 5)    # 0.8
-    add(st["epithelial tissue"], 0, 3, 0)    # GT 里没有：不进 mean/pooled，只进 all（误检）
-    add(st["mucin"], 1, 5, 5)                # 0.2
+    land = np.arange(N_LABELS)
+    add(st["epithelial tissue"], 4, 5, 5, land)    # 单张 Dice 0.8
+    add(st["epithelial tissue"], 4, 5, 5, land)    # 0.8
+    add(st["epithelial tissue"], 0, 3, 0, land)    # GT 里没有：不进 mean/pooled/landing，只进 all（误检）
+    add(st["mucin"], 1, 5, 5)                      # 0.2
     pc, gr = summarize(st, all_prompts=True)
 
     def close(a, b):
@@ -144,12 +168,22 @@ def selftest():
 
     e = pc["epithelial tissue"]
     assert e["tiles"] == 2 and close(e["mean"], 0.8) and close(e["pooled"], 0.8)
+    assert close(e["prec"], 0.8) and close(e["recall"], 0.8)
+    assert st["epithelial tissue"]["land"].tolist() == (2 * land).tolist()
     assert close(e["all"], 16 / 23)                          # 2*8 / (13+10)
     assert close(gr["ALL"]["macro"], 0.5)                    # (0.8 + 0.2) / 2
     assert close(gr["ALL"]["micro"], 18 / 30)                # 2*(8+1) / ((10+5)+(10+5))
     assert gr["related-in-training"]["classes"] == 1 and gr["absent-from-training"]["classes"] == 1
     assert pc["muscle tissue"]["tiles"] == 0 and pc["muscle tissue"]["mean"] != pc["muscle tissue"]["mean"]
+    assert parse_thrs("0.5,0.3, 0.3") == [0.3, 0.5]
     print("selftest OK")
+
+
+def parse_thrs(s):
+    thrs = sorted({float(x) for x in s.split(",") if x.strip()})
+    if not thrs or not all(0 < t < 1 for t in thrs):
+        raise ValueError(f"--thr 必须是 0 和 1 之间的数，用逗号分隔: {s}")
+    return thrs
 
 
 # ---------------- 数据 ----------------
@@ -279,34 +313,55 @@ def num(x):
     return f"{x:.4f}" if x == x else ""
 
 
-def report(per_class, groups, prompts, all_prompts, out_dir):
+def report(thr, per_class, groups, prompts, all_prompts):
+    """打印一个阈值下的结果表，返回写进 summary.csv 的行。"""
     pw = max(len(p) for p in prompts.values()) + 2
-    cols = ["mean", "pooled"] + (["all"] if all_prompts else [])
+    cols = ["mean", "pooled"] + (["all"] if all_prompts else []) + ["prec", "recall"]
     head = f"{'class':<26}{'group':<9}{'prompt':<{pw}}{'tiles':>6}" + "".join(f"{c:>8}" for c in cols)
-    print("\n" + head + "\n" + "-" * len(head))
+    print(f"\n===== thr = {thr} =====\n" + head + "\n" + "-" * len(head))
     rows = []
     for c in NAMES:
         r = per_class[c]
         grp = "related" if c in RELATED else "absent"
-        vals = [r["mean"], r["pooled"]] + ([r["all"]] if all_prompts else [])
+        vals = [r["mean"], r["pooled"]] + ([r["all"]] if all_prompts else []) + [r["prec"], r["recall"]]
         print(f"{c:<26}{grp:<9}{prompts[c]:<{pw}}{r['tiles']:>6}" + "".join(fmt(v) for v in vals))
-        rows.append(["class", c, grp, prompts[c], r["tiles"], num(r["mean"]), num(r["pooled"]), num(r["all"])])
+        rows.append([thr, "class", c, grp, prompts[c], r["tiles"], num(r["mean"]), num(r["pooled"]),
+                     num(r["all"]), num(r["prec"]), num(r["recall"])])
     print("-" * len(head))
     for g, r in groups.items():
         vals = [r["macro"], r["micro"]] + ([r["micro_all"]] if all_prompts else [])
         label = f"({r['classes']} classes)"
         print(f"{g:<26}{'':<9}{label:<{pw}}{'':>6}" + "".join(fmt(v) for v in vals))
-        rows.append(["group", g, "", "", r["classes"], num(r["macro"]), num(r["micro"]), num(r["micro_all"])])
-    print("\nmean   = 每张图 Dice 的平均；组那几行是各类 mean 再取平均（macro，每类权重相同）")
-    print("pooled = 所有图的像素合并后算一个 Dice；组那几行是跨类别合并（micro，大类权重大）")
-    if all_prompts:
-        print("all    = 同 pooled，但把 GT 里没有该类别的图也算进去（误检会拉低它）")
-    print("tiles  = GT 里出现该类别的图数；没出现过的类别不进入总体")
-    with open(os.path.join(out_dir, "summary.csv"), "w", newline="") as f:
-        w = csv.writer(f)
-        w.writerow(["level", "name", "group", "prompt", "tiles_or_classes",
-                    "mean_or_macro", "pooled_or_micro", "all_pooled"])
-        w.writerows(rows)
+        rows.append([thr, "group", g, "", "", r["classes"], num(r["macro"]), num(r["micro"]),
+                     num(r["micro_all"]), "", ""])
+    return rows
+
+
+def landing(stats):
+    """每个出现过的类别：(类别, 预测像素总数, 落在各 GT 标签上的比例)。"""
+    out = []
+    for c in NAMES:
+        if stats[c]["n"] == 0:
+            continue
+        land = stats[c]["land"]
+        tot = int(land.sum())
+        out.append((c, tot, land / tot if tot else np.full(N_LABELS, NAN)))
+    return out
+
+
+def print_landing(thr, stats):
+    head = f"{'prompt for':<26}{'pred_px':>10}" + "".join(f"{SHORT[v]:>7}" for v in range(N_LABELS))
+    print(f"\n预测像素落在哪里（thr = {thr}，只统计 GT 含该类别的图；每行加起来 = 100%）\n" + head)
+    for c, tot, frac in landing(stats):
+        print(f"{c:<26}{tot:>10}" + "".join(f"{x:7.1%}" if x == x else f"{'-':>7}" for x in frac))
+
+
+LEGEND = """
+mean   = 每张图 Dice 的平均；组那几行是各类 mean 再取平均（macro，每类权重相同）
+pooled = 所有图的像素合并后算一个 Dice；组那几行是跨类别合并（micro，大类权重大）
+all    = 同 pooled，但把 GT 里没有该类别的图也算进去（误检会拉低它；只在 --all-prompts 时有）
+prec   = 预测像素里落在该类别上的比例；recall = 该类别 GT 像素里被预测到的比例（都不含未标注区域）
+tiles  = GT 里出现该类别的图数；没出现过的类别不进入总体"""
 
 
 # ---------------- 主流程 ----------------
@@ -321,7 +376,7 @@ def main():
     ap.add_argument("--all-prompts", action="store_true", help="每张图都发全部 8 个 prompt，额外报告含误检的 Dice")
     ap.add_argument("--joint", action="store_true", help="一张图的 prompt 一次推理（更快，但 prompt 之间会相互影响）")
     ap.add_argument("--ignore-background", action="store_true", help="背景(11)像素也不参与计算")
-    ap.add_argument("--thr", type=float, default=0.5, help="概率阈值")
+    ap.add_argument("--thr", default="0.5", help="概率阈值，可用逗号给多个，例如 0.2,0.3,0.4,0.5")
     ap.add_argument("--limit", type=int, default=0, help="随机抽 N 张（固定种子），0 = 全部")
     ap.add_argument("--save-vis", type=int, default=0, help="保存前 N 张的对比图（原图 | GT | 预测）")
     ap.add_argument("--check", action="store_true", help="只检查数据，不加载模型")
@@ -331,6 +386,10 @@ def main():
     if a.selftest:
         selftest()
         return
+    try:
+        thrs = parse_thrs(a.thr)
+    except ValueError as e:
+        sys.exit(str(e))
     pairs, only_img, only_mask = pair_files(os.path.join(a.data, "image"), os.path.join(a.data, "mask"))
     if a.check:
         check(pairs, only_img, only_mask)
@@ -345,23 +404,25 @@ def main():
         pairs = sorted(random.Random(0).sample(pairs, min(a.limit, len(pairs))))
 
     prompts = build_prompts(a.template, a.trained_prompts)
+    vis_thr = min(thrs, key=lambda t: abs(t - 0.5))
     os.makedirs(a.out, exist_ok=True)
     if a.save_vis:
         os.makedirs(os.path.join(a.out, "vis"), exist_ok=True)
     with open(os.path.join(a.out, "config.json"), "w") as f:
-        json.dump({**vars(a), "prompts": prompts, "n_pairs": len(pairs),
+        json.dump({**vars(a), "thrs": thrs, "prompts": prompts, "n_pairs": len(pairs),
                    "unpaired_images": len(only_img), "unpaired_masks": len(only_mask)},
                   f, ensure_ascii=False, indent=2)
-    print(f"{len(pairs)} 张图；prompt: {json.dumps(prompts, ensure_ascii=False)}")
+    print(f"{len(pairs)} 张图；阈值 {thrs}；prompt: {json.dumps(prompts, ensure_ascii=False)}")
 
     model = load_model()
     from tqdm import tqdm
 
-    stats = {c: new_stat() for c in NAMES}
+    stats = {t: {c: new_stat() for c in NAMES} for t in thrs}
     n_eval, skipped, n_vis = 0, [], 0
     with open(os.path.join(a.out, "per_tile.csv"), "w", newline="") as f:
         w = csv.writer(f)
-        w.writerow(["file", "class", "prompt", "present", "gt_px", "pred_px", "tp", "dice"])
+        w.writerow(["thr", "file", "class", "prompt", "present", "gt_px", "pred_px", "tp", "dice"]
+                   + [f"pred_on_{v}" for v in range(N_LABELS)])
         for ip, mp in tqdm(pairs, dynamic_ncols=True):
             try:
                 image = np.array(Image.open(ip).convert("RGB"))
@@ -379,19 +440,38 @@ def main():
                 skipped.append((ip, "没有任何评测类别（只有未标注/背景）"))
                 continue
             probs = predict(model, image, [prompts[c] for c in todo], a.tile, a.joint)
-            for i, c in enumerate(todo):
-                tp, p, g = tile_counts(mask, probs[i] > a.thr, CLASSES[c][0], valid)
-                add(stats[c], tp, p, g)
-                w.writerow([os.path.basename(ip), c, prompts[c], int(g > 0), g, p, tp,
-                            f"{dice(tp, p, g):.4f}" if g > 0 else ""])
+            for t in thrs:                       # 多个阈值只是对同一张概率图换阈值，不重新推理
+                for i, c in enumerate(todo):
+                    pred = probs[i] > t
+                    tp, p, g = tile_counts(mask, pred, CLASSES[c][0], valid)
+                    land = pred_breakdown(mask, pred)
+                    add(stats[t][c], tp, p, g, land)
+                    w.writerow([t, os.path.basename(ip), c, prompts[c], int(g > 0), g, p, tp,
+                                f"{dice(tp, p, g):.4f}" if g > 0 else ""] + land.tolist())
             n_eval += 1
             if n_vis < a.save_vis:
                 stem = os.path.splitext(os.path.basename(ip))[0]
-                save_vis(os.path.join(a.out, "vis", f"{stem}.png"), image, mask, valid, probs, todo, a.thr)
+                save_vis(os.path.join(a.out, "vis", f"{stem}.png"), image, mask, valid, probs, todo, vis_thr)
                 n_vis += 1
 
-    per_class, groups = summarize(stats, a.all_prompts)
-    report(per_class, groups, prompts, a.all_prompts, a.out)
+    summary_rows, landing_rows = [], []
+    for t in thrs:
+        per_class, groups = summarize(stats[t], a.all_prompts)
+        summary_rows += report(t, per_class, groups, prompts, a.all_prompts)
+        landing_rows += [[t, c, tot] + [num(x) for x in frac] for c, tot, frac in landing(stats[t])]
+    print_landing(vis_thr, stats[vis_thr])      # 只打印最接近 0.5 的阈值；全部阈值都在 landing.csv 里
+    print(LEGEND)
+
+    with open(os.path.join(a.out, "summary.csv"), "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["thr", "level", "name", "group", "prompt", "tiles_or_classes",
+                    "mean_or_macro", "pooled_or_micro", "all_pooled", "precision", "recall"])
+        w.writerows(summary_rows)
+    with open(os.path.join(a.out, "landing.csv"), "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["thr", "prompt_for", "pred_px"] + [f"on_{v}_{SHORT[v]}" for v in range(N_LABELS)])
+        w.writerows(landing_rows)
+
     print(f"\n评测 {n_eval} 张；跳过 {len(skipped)} 张；结果在 {a.out}/")
     for ip, why in skipped[:5]:
         print(f"  跳过 {os.path.basename(ip)}: {why}")
