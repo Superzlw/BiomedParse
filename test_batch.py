@@ -7,6 +7,7 @@
   CUDA_VISIBLE_DEVICES=1 python test_batch.py --limit 50   # 随机抽 50 张试跑
   CUDA_VISIBLE_DEVICES=1 python test_batch.py              # 全量
   CUDA_VISIBLE_DEVICES=1 python test_batch.py --thr 0.2,0.3,0.4,0.5   # 一次评多个阈值（不增加推理次数）
+  CUDA_VISIBLE_DEVICES=1 python test_batch.py --only "<文件名>" --out out/single   # 只跑一张，存对比图
 
 评测协议（与 BiomedParse 论文一致）：每张图只对 GT 中出现的类别发 prompt，Dice 只在该类别出现的图上统计，
 衡量的是"已知目标存在时分得准不准"，不衡量"能否判断目标不存在"。
@@ -176,6 +177,9 @@ def selftest():
     assert gr["related-in-training"]["classes"] == 1 and gr["absent-from-training"]["classes"] == 1
     assert pc["muscle tissue"]["tiles"] == 0 and pc["muscle tissue"]["mean"] != pc["muscle tissue"]["mean"]
     assert parse_thrs("0.5,0.3, 0.3") == [0.3, 0.5]
+    prs = [("image/a[d=2.5,x=1].png", "mask/a[d=2.5,x=1].png"), ("image/b.png", "mask/b.png")]
+    assert select_files(prs, ["a[d=2.5,x=1]"]) == (prs[:1], [])                # 不带扩展名、名字里有小数点
+    assert select_files(prs, ["/x/image/b.png", "c"]) == (prs[1:], ["c"])     # 带路径；c 不存在
     print("selftest OK")
 
 
@@ -210,6 +214,20 @@ def pair_files(img_dir, mask_dir):
     imgs, masks = list_by_stem(img_dir), list_by_stem(mask_dir)
     common = sorted(imgs.keys() & masks.keys())
     return [(imgs[k], masks[k]) for k in common], imgs.keys() - masks.keys(), masks.keys() - imgs.keys()
+
+
+def select_files(pairs, names):
+    """--only：按文件名挑图，带不带扩展名、带不带路径都行。返回 (选中的 pairs, 没找到的名字)。
+    tile 名里本身有小数点（如 d=2.16945），所以不对传入的名字做 splitext，而是两种写法都去比。"""
+    want = {os.path.basename(n) for n in names}
+
+    def keys(ip):
+        b = os.path.basename(ip)
+        return {b, os.path.splitext(b)[0]}
+
+    picked = [p for p in pairs if keys(p[0]) & want]
+    found = set().union(*(keys(ip) for ip, _ in picked))
+    return picked, sorted(want - found)
 
 
 def label_names():
@@ -379,6 +397,8 @@ def main():
     ap.add_argument("--thr", default="0.5", help="概率阈值，可用逗号给多个，例如 0.2,0.3,0.4,0.5")
     ap.add_argument("--limit", type=int, default=0, help="随机抽 N 张（固定种子），0 = 全部")
     ap.add_argument("--save-vis", type=int, default=0, help="保存前 N 张的对比图（原图 | GT | 预测）")
+    ap.add_argument("--only", nargs="+", default=[], metavar="FILE",
+                    help="只跑这几张图（image/ 里的文件名，带不带扩展名都行），并保存它们的对比图")
     ap.add_argument("--check", action="store_true", help="只检查数据，不加载模型")
     ap.add_argument("--selftest", action="store_true", help="只测 Dice 计算逻辑")
     a = ap.parse_args()
@@ -400,6 +420,11 @@ def main():
         sys.exit("--template 里必须包含 {name}")
     if not os.path.exists("configs/biomedparse_inference.yaml"):
         sys.exit("请在 BiomedParse 仓库根目录运行")
+    if a.only:
+        pairs, missing = select_files(pairs, a.only)
+        if missing:
+            sys.exit(f"这些图在 image/ 和 mask/ 里没有配对上：{missing}")
+        a.save_vis = max(a.save_vis, len(pairs))
     if a.limit:
         pairs = sorted(random.Random(0).sample(pairs, min(a.limit, len(pairs))))
 
@@ -451,8 +476,11 @@ def main():
             n_eval += 1
             if n_vis < a.save_vis:
                 stem = os.path.splitext(os.path.basename(ip))[0]
-                save_vis(os.path.join(a.out, "vis", f"{stem}.png"), image, mask, valid, probs, todo, vis_thr)
+                vis_path = os.path.join(a.out, "vis", f"{stem}.png")
+                save_vis(vis_path, image, mask, valid, probs, todo, vis_thr)
                 n_vis += 1
+                if a.only:
+                    print(f"\n对比图：{vis_path}")
 
     summary_rows, landing_rows = [], []
     for t in thrs:
