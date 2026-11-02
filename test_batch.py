@@ -8,6 +8,7 @@
   CUDA_VISIBLE_DEVICES=1 python test_batch.py              # 全量
   CUDA_VISIBLE_DEVICES=1 python test_batch.py --thr 0.2,0.3,0.4,0.5   # 一次评多个阈值（不增加推理次数）
   CUDA_VISIBLE_DEVICES=1 python test_batch.py --only "<文件名>" --out out/single   # 只跑一张，存对比图
+  python test_batch.py --image-dir <图像文件夹> ...   # 直接给图像文件夹；mask 默认取旁边的 mask/，或用 --mask-dir 指定
 
 评测协议（与 BiomedParse 论文一致）：每张图只对 GT 中出现的类别发 prompt，Dice 只在该类别出现的图上统计，
 衡量的是"已知目标存在时分得准不准"，不衡量"能否判断目标不存在"。
@@ -386,7 +387,9 @@ tiles  = GT 里出现该类别的图数；没出现过的类别不进入总体""
 
 def main():
     ap = argparse.ArgumentParser(description="BiomedParse v1 组织分割批量评测")
-    ap.add_argument("--data", default=DEFAULT_DATA, help="包含 image/ 和 mask/ 的目录")
+    ap.add_argument("--data", default=DEFAULT_DATA, help="包含 image/ 和 mask/ 的目录（给了 --image-dir 就不用它）")
+    ap.add_argument("--image-dir", default="", help="直接指定图像文件夹，替代 --data")
+    ap.add_argument("--mask-dir", default="", help="mask 文件夹；默认是图像文件夹旁边的 mask/")
     ap.add_argument("--out", default="out/ukk_col_tissue", help="结果输出目录（不同设置请用不同目录）")
     ap.add_argument("--tile", type=int, default=0, help="切块边长；0 = 整张图直接推理")
     ap.add_argument("--template", default="{name}", help='prompt 模板，例如 "{name} in colon pathology"')
@@ -410,7 +413,13 @@ def main():
         thrs = parse_thrs(a.thr)
     except ValueError as e:
         sys.exit(str(e))
-    pairs, only_img, only_mask = pair_files(os.path.join(a.data, "image"), os.path.join(a.data, "mask"))
+    img_dir = os.path.normpath(a.image_dir or os.path.join(a.data, "image"))
+    mask_dir = os.path.normpath(a.mask_dir or os.path.join(os.path.dirname(img_dir), "mask"))
+    for d in (img_dir, mask_dir):
+        if not os.path.isdir(d):
+            sys.exit(f"文件夹不存在：{d}")
+    print(f"image: {img_dir}\nmask:  {mask_dir}")
+    pairs, only_img, only_mask = pair_files(img_dir, mask_dir)
     if a.check:
         check(pairs, only_img, only_mask)
         return
@@ -434,7 +443,8 @@ def main():
     if a.save_vis:
         os.makedirs(os.path.join(a.out, "vis"), exist_ok=True)
     with open(os.path.join(a.out, "config.json"), "w") as f:
-        json.dump({**vars(a), "thrs": thrs, "prompts": prompts, "n_pairs": len(pairs),
+        json.dump({**vars(a), "image_dir": img_dir, "mask_dir": mask_dir,
+                   "thrs": thrs, "prompts": prompts, "n_pairs": len(pairs),
                    "unpaired_images": len(only_img), "unpaired_masks": len(only_mask)},
                   f, ensure_ascii=False, indent=2)
     print(f"{len(pairs)} 张图；阈值 {thrs}；prompt: {json.dumps(prompts, ensure_ascii=False)}")
