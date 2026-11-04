@@ -17,9 +17,11 @@
   CUDA_VISIBLE_DEVICES=1 python test_batch_cell.py --limit 20   # 随机抽 20 张试跑
   CUDA_VISIBLE_DEVICES=1 python test_batch_cell.py              # 全量（重跑同一个 --out 会跳过已预测的 tile）
 
-prompt：默认 = 我们的类名（和我们的模型问同一个问题）；--trained-prompts = 最接近的 v1 训练目标
-（PanNuke：neoplastic / epithelial / inflammatory / connective tissue cells）。注意 v1 只有一个 "inflammatory cells"，
-所以 --trained-prompts 时 5 个免疫细胞类用同一张概率图，类别投票会把这些细胞全给排在前面的那一类 ——
+prompt = 官方用法（README："it can only reasonably segment the targets that it has learned during pretraining"，
+示例 prompts = ['neoplastic cells', 'inflammatory cells']）：只用 v1 学过的病理目标名
+（utilities/constants.py BIOMED_OBJECTS['Pathology'] = PanNuke 的 neoplastic / epithelial / inflammatory /
+connective tissue cells），见 CLASSES 第三列；没有对应目标的类（mitotic figures）不发 prompt，预测为空。
+v1 只有一个 "inflammatory cells"，所以 5 个免疫细胞类用同一张概率图，类别投票会把这些细胞全给排在前面的那一类 ——
 它们各自的 PQ 没有意义，看 binary 指标和有自己 prompt 的类（epithelial、stromal）。
 
 数据：<data>/image/<tile>.jpg + mask/<tile>.png + inst/<tile>.tif
@@ -44,7 +46,7 @@ DEFAULT_DATA = "/data/02_ZW/New_train/testds/Test_DS/Cell/ZW/07_Tiles"
 DEFAULT_VPR = "/data/02_ZW/New_train/VPR_LISA_BASED"
 UNANNOTATED, ROI_EMPTY = 0, 10
 
-# 通道: (我们的类名 = VPR targets.CELL_DISPLAY, mask 标签值, 最接近的 v1 训练目标；None = v1 训练数据里没有)
+# 通道: (我们的类名 = VPR targets.CELL_DISPLAY, mask 标签值, 官方 prompt = v1 学过的目标；None = 没有，不发 prompt)
 # 通道顺序 = VPR model.cell_branch.class_channels()（vocab.seg_cell_dict 按 id 排；benign 8 并进 epithelial）
 CLASSES = {
     1: ("neutrophils",      (1,),   ("inflammatory cells",)),
@@ -133,13 +135,9 @@ def check(tiles, missing, n=50):
 
 # ---------------- 预测 ----------------
 
-def prompts_for(template, trained):
-    """通道 -> 这一类的 prompt 列表（多个 prompt 的概率取最大值）。"""
-    out = {}
-    for c in CHANNELS:
-        name, _labels, tp = CLASSES[c]
-        out[c] = [template.format(name=p) for p in (tp if (trained and tp) else (name,))]
-    return out
+def prompts_for():
+    """通道 -> 这一类的官方 prompt 列表（多个 prompt 的概率取最大值；空 = 不发 prompt）。"""
+    return {c: list(CLASSES[c][2] or ()) for c in CHANNELS}
 
 
 def predict_tile(model, image, prompts, tile, joint, thr):
@@ -148,7 +146,9 @@ def predict_tile(model, image, prompts, tile, joint, thr):
     from test_batch import predict              # BiomedParse 组织评测的同一个推理函数
     unique = sorted({p for ps in prompts.values() for p in ps})
     probs = dict(zip(unique, predict(model, image, unique, tile, joint)))
-    stack = np.stack([np.max([probs[p] for p in prompts[c]], axis=0) for c in CHANNELS])     # (8, H, W)
+    H, W = image.shape[:2]
+    stack = np.stack([np.max([probs[p] for p in prompts[c]], axis=0) if prompts[c] else np.zeros((H, W), np.float32)
+                      for c in CHANNELS])                                                    # (8, H, W)
     masks = stack > thr
     logits = torch.from_numpy(stack - thr)
     best, idx = logits.max(0)
@@ -210,7 +210,8 @@ def print_pixels(s, min_cell_px, prompts):
         v = s["per_class"][name]
         drew = "    -" if v["drew_on_absent"] is None else f"{100 * v['drew_on_absent']:5.1f}"
         print(f"{name:<18}{v['n_present']:>6}{v['empty_present']:>7}{f(v['mean_dice']):>8}{f(v['pooled_dice']):>8}"
-              f"{f(v['precision']):>7}{f(v['recall']):>7}{v['n_absent']:>8}{drew:>7}  {' | '.join(prompts[c])}")
+              f"{f(v['precision']):>7}{f(v['recall']):>7}{v['n_absent']:>8}{drew:>7}  "
+              f"{' | '.join(prompts[c]) or '(no official prompt)'}")
     print(f"{'macro':<31}{f(s['macro_mean_dice']):>8}{f(s['macro_pooled_dice']):>8}")
     print(f"{s['n_tiles']} tiles from {s['n_slides']} slides")
 
@@ -270,9 +271,11 @@ def selftest(im):
             else:
                 assert s["macro_mean_dice"] == 0 and h["binary"]["model"]["pq"] == 0
     # 相同 prompt 合并、类别投票
-    pr = prompts_for("{name}", True)
+    pr = prompts_for()
     assert pr[1] == pr[3] == ["inflammatory cells"] and pr[2] == ["neoplastic cells", "epithelial cells"]
-    assert pr[7] == ["mitotic figures"] and prompts_for("{name} in pathology", False)[6] == ["stromal cells in pathology"]
+    assert pr[7] == [] and pr[6] == ["connective tissue cells"]
+    from utilities.constants import BIOMED_OBJECTS
+    assert {p for ps in pr.values() for p in ps} <= set(BIOMED_OBJECTS["Pathology"])
     print("selftest OK")
 
 
@@ -284,8 +287,6 @@ def main():
     ap.add_argument("--out", default="out/wns_cells", help="结果输出目录（不同设置请用不同目录）")
     ap.add_argument("--vpr-repo", default=DEFAULT_VPR, help="VPR_LISA_BASED 仓库（用它的 utils/instance_metrics.py）")
     ap.add_argument("--tile", type=int, default=0, help="切块边长；0 = 整张图直接推理")
-    ap.add_argument("--template", default="{name}", help='prompt 模板，例如 "{name} in pathology"')
-    ap.add_argument("--trained-prompts", action="store_true", help="改用最接近的 v1 训练目标作 prompt")
     ap.add_argument("--joint", action="store_true", help="一张图的 prompt 一次推理（更快，但 prompt 之间会相互影响）")
     ap.add_argument("--thr", type=float, default=0.5, help="概率阈值")
     ap.add_argument("--min-cell-px", type=int, default=200, help="这类 GT 像素 >= 此值的 tile 才算 present")
@@ -305,13 +306,11 @@ def main():
         return
     if not tiles:
         sys.exit("没有配对成功的 tile，先跑 --check")
-    if "{name}" not in a.template:
-        sys.exit("--template 里必须包含 {name}")
     if not os.path.exists("configs/biomedparse_inference.yaml"):
         sys.exit("请在 BiomedParse 仓库根目录运行")
     if a.limit:
         tiles = sorted(random.Random(0).sample(tiles, min(a.limit, len(tiles))))
-    prompts = prompts_for(a.template, a.trained_prompts)
+    prompts = prompts_for()
 
     pred_dir = os.path.join(a.out, "pred")
     os.makedirs(pred_dir, exist_ok=True)
